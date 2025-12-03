@@ -33,6 +33,10 @@ app.add_middleware(
 app.mount("/files", StaticFiles(directory=UPLOAD_DIR), name="files")
 app.include_router(upload_router)
 
+@app.get("/health")
+async def health_check():
+    return {"ok": True}
+
 # Cleanup uploads on server start: remove DM/GC folders and clear main files
 try:
     import shutil
@@ -315,4 +319,3 @@ try:
         app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="spa")
 except Exception:
     pass
-
