@@ -7,6 +7,7 @@ from ..upload import UPLOAD_DIR
 from ..auth import SECRET_KEY, ALGORITHM
 from ..ollama_client import stream_ollama, TEXT_MODEL
 import logging
+from http.cookies import SimpleCookie
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,27 @@ manager = ConnMgr()
 manager.HISTORY = 500 if hasattr(manager, 'HISTORY') else None
 # Map usernames to last known IP
 manager.user_ips = {}  # username -> last known IP
+
+DEV_COOKIE_NAME = os.environ.get("CA_DEV_COOKIE_NAME", "ca_dev_pass")
+DEV_COOKIE_SECRET = os.environ.get("CA_DEV_COOKIE_SECRET", "71060481")
+
+def _has_dev_cookie(ws: WebSocket) -> bool:
+    raw = None
+    try:
+        raw = ws.headers.get("cookie") or ws.headers.get("Cookie")
+    except Exception:
+        raw = None
+    if not raw:
+        return False
+    try:
+        jar = SimpleCookie()
+        jar.load(raw)
+        morsel = jar.get(DEV_COOKIE_NAME)
+        if not morsel:
+            return False
+        return morsel.value == DEV_COOKIE_SECRET
+    except Exception:
+        return False
 
 # --- AI controls/state ---
 ai_enabled = True
@@ -251,9 +273,14 @@ async def ws_handler(ws: WebSocket, token: str):
         await ws.send_text(json.dumps({"type": "gc_list", "gcs": gcs}))
     except Exception:
         pass
-    # Special DEV tag for localhost connections — DEV is superior to admin but not assigned admin role
+    # Special DEV tag for localhost connections or dev cookie — DEV is superior to admin but not assigned admin role
     try:
+        apply_dev = False
         if ip in ("127.0.0.1", "::1", "localhost"):
+            apply_dev = True
+        elif _has_dev_cookie(ws):
+            apply_dev = True
+        if apply_dev:
             # Preserve any existing personal tag text, just enforce DEV styling
             existing = manager.tags.get(sub) if isinstance(manager.tags, dict) else None
             text = None
