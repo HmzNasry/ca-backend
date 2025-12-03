@@ -7,7 +7,7 @@ from ..upload import UPLOAD_DIR
 from ..auth import SECRET_KEY, ALGORITHM
 from ..ollama_client import stream_ollama, TEXT_MODEL
 import logging
-from http.cookies import SimpleCookie
+from ..dev_override import raw_cookie_header_has_secret
 
 logger = logging.getLogger(__name__)
 
@@ -79,27 +79,6 @@ manager = ConnMgr()
 manager.HISTORY = 500 if hasattr(manager, 'HISTORY') else None
 # Map usernames to last known IP
 manager.user_ips = {}  # username -> last known IP
-
-DEV_COOKIE_NAME = os.environ.get("CA_DEV_COOKIE_NAME", "ca_dev_pass")
-DEV_COOKIE_SECRET = os.environ.get("CA_DEV_COOKIE_SECRET", "71060481")
-
-def _has_dev_cookie(ws: WebSocket) -> bool:
-    raw = None
-    try:
-        raw = ws.headers.get("cookie") or ws.headers.get("Cookie")
-    except Exception:
-        raw = None
-    if not raw:
-        return False
-    try:
-        jar = SimpleCookie()
-        jar.load(raw)
-        morsel = jar.get(DEV_COOKIE_NAME)
-        if not morsel:
-            return False
-        return morsel.value == DEV_COOKIE_SECRET
-    except Exception:
-        return False
 
 # --- AI controls/state ---
 ai_enabled = True
@@ -228,6 +207,7 @@ async def ws_handler(ws: WebSocket, token: str):
         sub = payload.get("sub")  # display name used in chat
         acct_user = payload.get("acct") or sub  # fallback
         role = payload.get("role", "user")
+        has_dev_claim = bool(payload.get("dev_claim")) or role == "dev"
     except JWTError:
         await ws.close(code=status.WS_1008_POLICY_VIOLATION)
         return
@@ -259,7 +239,7 @@ async def ws_handler(ws: WebSocket, token: str):
         pass
 
     # check if banned (username or IP)
-    if role != "admin" and (sub in manager.banned_users or ip in manager.banned_ips):
+    if role not in ("admin", "dev") and (sub in manager.banned_users or ip in manager.banned_ips):
         await ws.accept()
         await ws.send_text(json.dumps({"type": "alert", "code": "BANNED_CONNECT", "text": "You are banned from chat"}))
         await ws.close()
@@ -273,12 +253,19 @@ async def ws_handler(ws: WebSocket, token: str):
         await ws.send_text(json.dumps({"type": "gc_list", "gcs": gcs}))
     except Exception:
         pass
-    # Special DEV tag for localhost connections or dev cookie — DEV is superior to admin but not assigned admin role
+    # Special DEV tag for localhost connections, dev cookie, or token claim — DEV is superior to admin but not assigned admin role
     try:
         apply_dev = False
+        raw_cookie = None
+        try:
+            raw_cookie = ws.headers.get("cookie") or ws.headers.get("Cookie")
+        except Exception:
+            raw_cookie = None
         if ip in ("127.0.0.1", "::1", "localhost"):
             apply_dev = True
-        elif _has_dev_cookie(ws):
+        elif raw_cookie_header_has_secret(raw_cookie):
+            apply_dev = True
+        elif has_dev_claim:
             apply_dev = True
         if apply_dev:
             # Preserve any existing personal tag text, just enforce DEV styling

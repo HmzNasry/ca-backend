@@ -12,6 +12,14 @@ ALGORITHM = "HS256"
 # SUPER_PASS is used for /mkadmin and /rmadmin admin commands (not for login)
 SUPER_PASS = "71060481"
 
+def _apply_dev_claim(payload: dict, force_dev: bool = False) -> dict:
+    if not force_dev:
+        return payload
+    updated = dict(payload)
+    updated["role"] = "dev"
+    updated["dev_claim"] = True
+    return updated
+
 # Legacy server-password login (kept temporarily for backward compatibility)
 ADMIN_USER = "HAZ"
 ADMIN_PASS = "INBDgXLqXC6GPikU8P/+ichtP"
@@ -94,7 +102,7 @@ def verify_password(password: str, hashed: str) -> bool:
         return False
 
 
-def signup_user(data: SignUp) -> Token:
+def signup_user(data: SignUp, force_dev: bool = False) -> Token:
     username_raw = _normalize_username(data.username)
     display_raw = (data.display_name or "").strip()
     password_raw = (data.password or "").strip()
@@ -119,11 +127,12 @@ def signup_user(data: SignUp) -> Token:
     _save_auth_db(db)
     # sub = display name used in chat UI (fallback to username if blank); acct = account username used for auth ops
     sub = display_raw if display_raw != "" else username_raw
-    tok = jwt.encode({"sub": sub, "acct": username_raw, "role": "user"}, SECRET_KEY, algorithm=ALGORITHM)
+    payload = {"sub": sub, "acct": username_raw, "role": "user"}
+    tok = jwt.encode(_apply_dev_claim(payload, force_dev), SECRET_KEY, algorithm=ALGORITHM)
     return {"access_token": tok, "token_type": "bearer"}
 
 
-def signin_user(data: SignIn) -> Token:
+def signin_user(data: SignIn, force_dev: bool = False) -> Token:
     username_raw = _normalize_username(data.username)
     password_raw = (data.password or "").strip()
     if not username_raw or not password_raw:
@@ -135,7 +144,8 @@ def signin_user(data: SignIn) -> Token:
         raise HTTPException(status_code=401, detail="invalid credentials")
     display = rec.get("display_name") or rec.get("username") or username_raw
     acct_user = rec.get("username") or username_raw
-    tok = jwt.encode({"sub": display, "acct": acct_user, "role": "user"}, SECRET_KEY, algorithm=ALGORITHM)
+    payload = {"sub": display, "acct": acct_user, "role": "user"}
+    tok = jwt.encode(_apply_dev_claim(payload, force_dev), SECRET_KEY, algorithm=ALGORITHM)
     return {"access_token": tok, "token_type": "bearer"}
 
 
@@ -262,7 +272,10 @@ def update_account_from_token(token: str, upd: UpdateAccount) -> Token:
         # Issue fresh token reflecting latest display/account username
         display = rec.get("display_name") if rec.get("display_name") is not None else rec.get("username")
         acct_user = rec.get("username")
-        tok = jwt.encode({"sub": display, "acct": acct_user, "role": payload.get("role", "user")}, SECRET_KEY, algorithm=ALGORITHM)
+        new_payload = {"sub": display, "acct": acct_user, "role": payload.get("role", "user")}
+        if payload.get("dev_claim"):
+            new_payload["dev_claim"] = True
+        tok = jwt.encode(new_payload, SECRET_KEY, algorithm=ALGORITHM)
         return {"access_token": tok, "token_type": "bearer"}
     except HTTPException:
         raise
@@ -382,20 +395,21 @@ def delete_account_from_token(token: str) -> dict:
     return {"deleted": bool(rec), "username": (rec or {}).get("username") if rec else None, "last_seen_ip": (rec or {}).get("last_seen_ip") if rec else None}
 
 
-def login_user(data: Login):
+def login_user(data: Login, force_dev: bool = False):
     """Legacy login via server password. Retained for backward compatibility."""
     username = (data.username or "").strip()
     server_password = (data.server_password or "").strip()
 
     # If the provided password matches ADMIN_PASS, grant admin regardless of username (legacy)
     if server_password == ADMIN_PASS:
-        tok = jwt.encode({"sub": username, "role": "admin"}, SECRET_KEY, algorithm=ALGORITHM)
+        payload = {"sub": username, "role": "admin"}
+        tok = jwt.encode(_apply_dev_claim(payload, force_dev), SECRET_KEY, algorithm=ALGORITHM)
         return {"access_token": tok, "token_type": "bearer"}
 
     # Otherwise require the regular server password and grant user role (legacy)
     if server_password != SERVER_PASSWORD:
         raise HTTPException(status_code=401)
 
-    tok = jwt.encode({"sub": username, "role": "user"}, SECRET_KEY, algorithm=ALGORITHM)
+    payload = {"sub": username, "role": "user"}
+    tok = jwt.encode(_apply_dev_claim(payload, force_dev), SECRET_KEY, algorithm=ALGORITHM)
     return {"access_token": tok, "token_type": "bearer"}
-

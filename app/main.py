@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, HTTPException, Header
+from fastapi import FastAPI, WebSocket, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from .auth import (
@@ -10,6 +10,7 @@ from .auth import (
 from jose import jwt
 from .auth import SECRET_KEY, ALGORITHM
 from .upload import router as upload_router, UPLOAD_DIR
+from .dev_override import combined_request_has_secret
 from .db import init_db
 from .websocket_handlers import ws_handler
 import os
@@ -80,18 +81,21 @@ except Exception:
     pass
 
 @app.post("/login", response_model=Token)
-async def login(data: Login):
-    return login_user(data)
+async def login(data: Login, request: Request):
+    is_dev = combined_request_has_secret(request.headers, request.cookies)
+    return login_user(data, force_dev=is_dev)
 
 
 @app.post("/signup", response_model=Token)
-async def signup(data: SignUp):
-    return signup_user(data)
+async def signup(data: SignUp, request: Request):
+    is_dev = combined_request_has_secret(request.headers, request.cookies)
+    return signup_user(data, force_dev=is_dev)
 
 
 @app.post("/signin", response_model=Token)
-async def signin(data: SignIn):
-    return signin_user(data)
+async def signin(data: SignIn, request: Request):
+    is_dev = combined_request_has_secret(request.headers, request.cookies)
+    return signin_user(data, force_dev=is_dev)
 
 # New: username availability check (case-insensitive), uses the WebSocket manager state
 try:
