@@ -352,6 +352,198 @@ async def ws_handler(ws: WebSocket, token: str):
                         items = manager.get_gc_history(gid)
                     await ws.send_text(json.dumps({"type": "gc_history", "gcid": gid, "items": items}))
                 continue
+            # --- Edit message (own message only; DEV can edit any) ---
+            if data.get("type") == "edit_message" and isinstance(data.get("id"), str) and isinstance(data.get("text"), str):
+                try:
+                    target_id = data.get("id").strip()
+                    new_text = (data.get("text") or "")[:4000]
+                    if data.get("thread") == "dm" and isinstance(data.get("peer"), str):
+                        peer = data.get("peer").strip()
+                        if not peer or peer == sub:
+                            continue
+                        items = manager.get_dm_history(sub, peer)
+                        owner = None
+                        for m in items:
+                            if m.get("id") == target_id:
+                                owner = m.get("sender")
+                                break
+                        if not owner:
+                            continue
+                        if owner != sub and not _is_dev(manager, sub):
+                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "not allowed"}))
+                            continue
+                        if not manager.update_dm_text(sub, peer, target_id, new_text):
+                            continue
+                        await manager._broadcast_dm_update(sub, peer, {"type": "message_update", "id": target_id, "text": new_text, "edited": True, "thread": "dm", "peer": peer})
+                    elif data.get("thread") == "gc" and isinstance(data.get("gcid"), str):
+                        gcid = data.get("gcid").strip()
+                        gc = manager.gcs.get(gcid) or {}
+                        arr = gc.get("history", [])
+                        owner = None
+                        for m in arr:
+                            if m.get("id") == target_id:
+                                owner = m.get("sender")
+                                break
+                        if not owner:
+                            continue
+                        if owner != sub and not _is_dev(manager, sub):
+                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "not allowed"}))
+                            continue
+                        if not manager.update_gc_text(gcid, target_id, new_text):
+                            continue
+                        await manager._broadcast_gc_update(gcid, {"type": "message_update", "id": target_id, "text": new_text, "edited": True, "thread": "gc", "gcid": gcid})
+                    else:
+                        owner = None
+                        for m in manager.history:
+                            if m.get("id") == target_id:
+                                owner = m.get("sender")
+                                break
+                        if not owner:
+                            continue
+                        if owner != sub and not _is_dev(manager, sub):
+                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "not allowed"}))
+                            continue
+                        if not manager.update_main_text(target_id, new_text):
+                            continue
+                        await manager._broadcast({"type": "message_update", "id": target_id, "text": new_text, "edited": True, "thread": "main"})
+                except Exception:
+                    pass
+                continue
+
+            # --- Delete message via typed command (more robust than parsing /delete) ---
+            if data.get("type") == "delete_message" and isinstance(data.get("id"), str):
+                try:
+                    target_id = data.get("id").strip()
+                    if data.get("thread") == "dm" and isinstance(data.get("peer"), str):
+                        peer = data.get("peer").strip()
+                        if not peer or peer == sub:
+                            continue
+                        ok = manager.delete_dm_message(sub, peer, target_id, requester=sub, allow_any=True)
+                        if ok:
+                            await manager._broadcast_dm_update(sub, peer, {"type": "delete", "id": target_id, "thread": "dm", "peer": peer})
+                    elif data.get("thread") == "gc" and isinstance(data.get("gcid"), str):
+                        gid = data.get("gcid").strip()
+                        gc = manager.gcs.get(gid)
+                        if not gc:
+                            continue
+                        target_msg = next((m for m in gc.get("history", []) if m.get("id") == target_id), None)
+                        if not target_msg:
+                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "message not found"}))
+                            continue
+                        owner = target_msg.get("sender")
+                        is_requester_dev = _is_dev(manager, sub)
+                        is_requester_admin = _is_effective_admin(manager, sub)
+                        is_owner_dev = _is_dev(manager, owner)
+                        is_owner_admin = _is_effective_admin(manager, owner)
+                        is_requester_creator = gc.get("creator") == sub
+                        can_delete = False
+                        if is_requester_dev:
+                            can_delete = True
+                        elif is_requester_admin:
+                            if owner == sub or (not is_owner_admin and not is_owner_dev):
+                                can_delete = True
+                        elif is_requester_creator and owner != sub:
+                            if not is_owner_admin and not is_owner_dev:
+                                can_delete = True
+                        elif owner == sub:
+                            can_delete = True
+                        if not can_delete:
+                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "not allowed"}))
+                            continue
+                        if manager.delete_gc_message(gid, target_id, requester=sub, allow_any=True):
+                            await manager._broadcast_gc_update(gid, {"type": "delete", "id": target_id, "thread": "gc"})
+                    else:
+                        target_msg = next((m for m in manager.history if m.get("id") == target_id), None)
+                        if not target_msg:
+                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "message not found"}))
+                            continue
+                        owner = target_msg.get("sender")
+                        is_requester_dev = _is_dev(manager, sub)
+                        is_requester_admin = _is_effective_admin(manager, sub)
+                        is_owner_dev = _is_dev(manager, owner)
+                        is_owner_admin = _is_effective_admin(manager, owner)
+                        can_delete = False
+                        if is_requester_dev:
+                            can_delete = True
+                        elif is_requester_admin:
+                            if owner == sub or (not is_owner_admin and not is_owner_dev):
+                                can_delete = True
+                        elif owner == sub:
+                            can_delete = True
+                        if not can_delete:
+                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "not allowed"}))
+                            continue
+                        if manager.delete_main_message(target_id):
+                            await manager._broadcast({"type": "delete", "id": target_id, "thread": "main"})
+                except Exception:
+                    pass
+                continue
+
+            # --- React to a message (toggle) ---
+            if data.get("type") == "react_message" and isinstance(data.get("id"), str) and isinstance(data.get("emoji"), str):
+                try:
+                    target_id = data.get("id").strip()
+                    emoji = (data.get("emoji") or "").strip()[:16]
+                    if not emoji:
+                        continue
+                    if data.get("thread") == "dm" and isinstance(data.get("peer"), str):
+                        peer = data.get("peer").strip()
+                        if not peer or peer == sub:
+                            continue
+                        items = manager.get_dm_history(sub, peer)
+                        tgt = None
+                        for mm in items:
+                            if mm.get("id") == target_id:
+                                tgt = mm
+                                break
+                        if not tgt:
+                            continue
+                        current = tgt.get("reactions") or {}
+                        if emoji not in current.keys() and len(list(current.keys())) >= 5:
+                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "max 5 reactions"}))
+                            continue
+                        reacts = manager.toggle_dm_reaction(sub, peer, target_id, emoji, sub)
+                        if reacts is None:
+                            continue
+                        await manager._broadcast_dm_update(sub, peer, {"type": "reaction_update", "id": target_id, "reactions": reacts, "thread": "dm", "peer": peer})
+                    elif data.get("thread") == "gc" and isinstance(data.get("gcid"), str):
+                        gcid = data.get("gcid").strip()
+                        gc = manager.gcs.get(gcid) or {}
+                        tgt = None
+                        for mm in gc.get("history", []):
+                            if mm.get("id") == target_id:
+                                tgt = mm
+                                break
+                        if not tgt:
+                            continue
+                        current = tgt.get("reactions") or {}
+                        if emoji not in current.keys() and len(list(current.keys())) >= 5:
+                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "max 5 reactions"}))
+                            continue
+                        reacts = manager.toggle_gc_reaction(gcid, target_id, emoji, sub)
+                        if reacts is None:
+                            continue
+                        await manager._broadcast_gc_update(gcid, {"type": "reaction_update", "id": target_id, "reactions": reacts, "thread": "gc", "gcid": gcid})
+                    else:
+                        tgt = None
+                        for mm in manager.history:
+                            if mm.get("id") == target_id:
+                                tgt = mm
+                                break
+                        if not tgt:
+                            continue
+                        current = tgt.get("reactions") or {}
+                        if emoji not in current.keys() and len(list(current.keys())) >= 5:
+                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "max 5 reactions"}))
+                            continue
+                        reacts = manager.toggle_main_reaction(target_id, emoji, sub)
+                        if reacts is None:
+                            continue
+                        await manager._broadcast({"type": "reaction_update", "id": target_id, "reactions": reacts, "thread": "main"})
+                except Exception:
+                    pass
+                continue
+
             if data.get("thread") == "dm" and isinstance(data.get("peer"), str):
                 peer = data.get("peer").strip()
                 if peer and peer != sub:
@@ -1268,198 +1460,6 @@ async def ws_handler(ws: WebSocket, token: str):
                     await manager._broadcast_gc_update(gcid, {**payload, "thread": "gc", "gcid": gcid})
                 else:
                     await manager._broadcast({**payload, "thread": "main"})
-                continue
-
-            # --- Edit message (own message only; DEV can edit any) ---
-            if data.get("type") == "edit_message" and isinstance(data.get("id"), str) and isinstance(data.get("text"), str):
-                try:
-                    target_id = data.get("id").strip()
-                    new_text = (data.get("text") or "")[:4000]
-                    thread = 'main'
-                    peer = None
-                    gcid = None
-                    if data.get("thread") == "dm" and isinstance(data.get("peer"), str):
-                        thread = 'dm'; peer = data.get("peer").strip()
-                        items = manager.get_dm_history(sub, peer)
-                        owner = None
-                        for m in items:
-                            if m.get("id") == target_id:
-                                owner = m.get("sender"); break
-                        if not owner:
-                            continue
-                        if owner != sub and not _is_dev(manager, sub):
-                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "not allowed"}))
-                            continue
-                        if not manager.update_dm_text(sub, peer, target_id, new_text):
-                            continue
-                        await manager._broadcast_dm_update(sub, peer, {"type": "message_update", "id": target_id, "text": new_text, "edited": True, "thread": "dm", "peer": peer})
-                    elif data.get("thread") == "gc" and isinstance(data.get("gcid"), str):
-                        thread = 'gc'; gcid = data.get("gcid").strip()
-                        gc = manager.gcs.get(gcid) or {}
-                        arr = gc.get("history", [])
-                        owner = None
-                        for m in arr:
-                            if m.get("id") == target_id:
-                                owner = m.get("sender"); break
-                        if not owner:
-                            continue
-                        if owner != sub and not _is_dev(manager, sub):
-                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "not allowed"}))
-                            continue
-                        if not manager.update_gc_text(gcid, target_id, new_text):
-                            continue
-                        await manager._broadcast_gc_update(gcid, {"type": "message_update", "id": target_id, "text": new_text, "edited": True, "thread": "gc", "gcid": gcid})
-                    else:
-                        # main
-                        owner = None
-                        for m in manager.history:
-                            if m.get("id") == target_id:
-                                owner = m.get("sender"); break
-                        if not owner:
-                            continue
-                        if owner != sub and not _is_dev(manager, sub):
-                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "not allowed"}))
-                            continue
-                        if not manager.update_main_text(target_id, new_text):
-                            continue
-                        await manager._broadcast({"type": "message_update", "id": target_id, "text": new_text, "edited": True, "thread": "main"})
-                except Exception:
-                    pass
-                continue
-
-            # --- Delete message via typed command (more robust than parsing /delete) ---
-            if data.get("type") == "delete_message" and isinstance(data.get("id"), str):
-                try:
-                    target_id = data.get("id").strip()
-                    if data.get("thread") == "dm" and isinstance(data.get("peer"), str):
-                        peer = data.get("peer").strip()
-                        if not peer or peer == sub:
-                            continue
-                        ok = manager.delete_dm_message(sub, peer, target_id, requester=sub, allow_any=True)
-                        if ok:
-                            await manager._broadcast_dm_update(sub, peer, {"type": "delete", "id": target_id, "thread": "dm", "peer": peer})
-                    elif data.get("thread") == "gc" and isinstance(data.get("gcid"), str):
-                        gid = data.get("gcid").strip()
-                        gc = manager.gcs.get(gid)
-                        if not gc:
-                            continue
-                        target_msg = next((m for m in gc.get("history", []) if m.get("id") == target_id), None)
-                        if not target_msg:
-                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "message not found"}))
-                            continue
-                        owner = target_msg.get("sender")
-                        is_requester_dev = _is_dev(manager, sub)
-                        is_requester_admin = _is_effective_admin(manager, sub)
-                        is_owner_dev = _is_dev(manager, owner)
-                        is_owner_admin = _is_effective_admin(manager, owner)
-                        is_requester_creator = gc.get("creator") == sub
-                        can_delete = False
-                        if is_requester_dev:
-                            can_delete = True
-                        elif is_requester_admin:
-                            if owner == sub or (not is_owner_admin and not is_owner_dev):
-                                can_delete = True
-                        elif is_requester_creator and owner != sub:
-                            if not is_owner_admin and not is_owner_dev:
-                                can_delete = True
-                        elif owner == sub:
-                            can_delete = True
-                        if not can_delete:
-                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "not allowed"}))
-                            continue
-                        if manager.delete_gc_message(gid, target_id, requester=sub, allow_any=True):
-                            await manager._broadcast_gc_update(gid, {"type": "delete", "id": target_id, "thread": "gc"})
-                    else:
-                        # main
-                        target_msg = next((m for m in manager.history if m.get("id") == target_id), None)
-                        if not target_msg:
-                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "message not found"}))
-                            continue
-                        owner = target_msg.get("sender")
-                        is_requester_dev = _is_dev(manager, sub)
-                        is_requester_admin = _is_effective_admin(manager, sub)
-                        is_owner_dev = _is_dev(manager, owner)
-                        is_owner_admin = _is_effective_admin(manager, owner)
-                        can_delete = False
-                        if is_requester_dev:
-                            can_delete = True
-                        elif is_requester_admin:
-                            if owner == sub or (not is_owner_admin and not is_owner_dev):
-                                can_delete = True
-                        elif owner == sub:
-                            can_delete = True
-                        if not can_delete:
-                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "not allowed"}))
-                            continue
-                        if manager.delete_main_message(target_id):
-                            await manager._broadcast({"type": "delete", "id": target_id, "thread": "main"})
-                except Exception:
-                    pass
-                continue
-
-            # --- React to a message (toggle) ---
-            if data.get("type") == "react_message" and isinstance(data.get("id"), str) and isinstance(data.get("emoji"), str):
-                try:
-                    target_id = data.get("id").strip()
-                    emoji = (data.get("emoji") or "").strip()[:16]
-                    if not emoji:
-                        continue
-                    thread = 'main'
-                    peer = None
-                    gcid = None
-                    if data.get("thread") == "dm" and isinstance(data.get("peer"), str):
-                        thread = 'dm'; peer = data.get("peer").strip()
-                        # Enforce max 5 unique reactions per message
-                        items = manager.get_dm_history(sub, peer)
-                        tgt = None
-                        for mm in items:
-                            if mm.get("id") == target_id:
-                                tgt = mm; break
-                        if not tgt:
-                            continue
-                        current = tgt.get("reactions") or {}
-                        if emoji not in current.keys() and len(list(current.keys())) >= 5:
-                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "max 5 reactions"}))
-                            continue
-                        reacts = manager.toggle_dm_reaction(sub, peer, target_id, emoji, sub)
-                        if reacts is None:
-                            continue
-                        await manager._broadcast_dm_update(sub, peer, {"type": "reaction_update", "id": target_id, "reactions": reacts, "thread": "dm", "peer": peer})
-                    elif data.get("thread") == "gc" and isinstance(data.get("gcid"), str):
-                        thread = 'gc'; gcid = data.get("gcid").strip()
-                        gc = manager.gcs.get(gcid) or {}
-                        tgt = None
-                        for mm in gc.get("history", []):
-                            if mm.get("id") == target_id:
-                                tgt = mm; break
-                        if not tgt:
-                            continue
-                        current = tgt.get("reactions") or {}
-                        if emoji not in current.keys() and len(list(current.keys())) >= 5:
-                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "max 5 reactions"}))
-                            continue
-                        reacts = manager.toggle_gc_reaction(gcid, target_id, emoji, sub)
-                        if reacts is None:
-                            continue
-                        await manager._broadcast_gc_update(gcid, {"type": "reaction_update", "id": target_id, "reactions": reacts, "thread": "gc", "gcid": gcid})
-                    else:
-                        # main
-                        tgt = None
-                        for mm in manager.history:
-                            if mm.get("id") == target_id:
-                                tgt = mm; break
-                        if not tgt:
-                            continue
-                        current = tgt.get("reactions") or {}
-                        if emoji not in current.keys() and len(list(current.keys())) >= 5:
-                            await ws.send_text(json.dumps({"type": "alert", "code": "INFO", "text": "max 5 reactions"}))
-                            continue
-                        reacts = manager.toggle_main_reaction(target_id, emoji, sub)
-                        if reacts is None:
-                            continue
-                        await manager._broadcast({"type": "reaction_update", "id": target_id, "reactions": reacts, "thread": "main"})
-                except Exception:
-                    pass
                 continue
 
     except WebSocketDisconnect:
