@@ -1,11 +1,11 @@
-import json
-import os
 import uuid
 from datetime import datetime
 from fastapi import HTTPException
 from jose import jwt
 from passlib.context import CryptContext
 from .models.auth_models import Login, Token, SignUp, SignIn, AccountInfo, UpdateAccount
+from .db import SessionLocal
+from .db_models import AccountUser
 
 SECRET_KEY = "41bbd87b957b7261457a5cb438974dd9f9131cc1f9a1099afb314cbd843ee642"
 ALGORITHM = "HS256"
@@ -25,29 +25,32 @@ ADMIN_USER = "HAZ"
 ADMIN_PASS = "INBDgXLqXC6GPikU8P/+ichtP"
 SERVER_PASSWORD = "securepass32x1"
 
-# Simple file-backed account store
-AUTH_USERS_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "auth_users.json"))
+# Simple database-backed account store
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
-def _load_auth_db():
+def _format_iso(dt: datetime | None) -> str | None:
+    if not dt:
+        return None
     try:
-        if os.path.exists(AUTH_USERS_FILE):
-            with open(AUTH_USERS_FILE, "r") as f:
-                data = json.load(f) or {}
-            if isinstance(data, dict):
-                return {"users": dict(data.get("users", {}))}
+        return dt.replace(tzinfo=None).isoformat() + "Z"
     except Exception:
-        pass
-    return {"users": {}}
+        return None
 
 
-def _save_auth_db(db: dict):
-    try:
-        with open(AUTH_USERS_FILE, "w") as f:
-            json.dump(db, f, indent=2)
-    except Exception:
-        pass
+def _account_to_info_obj(acc: AccountUser) -> AccountInfo:
+    return AccountInfo(
+        username=acc.username or "",
+        display_name=acc.display_name or (acc.username or ""),
+        created_at=_format_iso(acc.created_at),
+        last_seen_ip=acc.last_seen_ip,
+    )
+
+
+def _get_account_by_key(db, username_key: str) -> AccountUser | None:
+    if not username_key:
+        return None
+    return db.query(AccountUser).filter(AccountUser.username_key == username_key).one_or_none()
 
 
 def list_account_usernames() -> list[str]:
@@ -55,31 +58,22 @@ def list_account_usernames() -> list[str]:
     Uses case preserved 'username' values as stored.
     """
     try:
-        db = _load_auth_db()
-        users = []
-        for rec in (db.get("users", {}) or {}).values():
-            u = (rec or {}).get("username")
-            if isinstance(u, str) and u.strip():
-                users.append(u)
-        # de-dup and sort
+        with SessionLocal() as db:
+            rows = db.query(AccountUser.username).all()
+            users = [row[0] for row in rows if isinstance(row[0], str) and row[0].strip()]
         return sorted(list({*users}))
     except Exception:
         return []
 
 
 def reset_auth():
-    """Reset the account database (auth_users.json) to an empty state."""
+    """Reset the account database to an empty state."""
     try:
-        _save_auth_db({"users": {}})
+        with SessionLocal() as db:
+            db.query(AccountUser).delete()
+            db.commit()
     except Exception:
         pass
-
-
-def _now_iso():
-    try:
-        return datetime.utcnow().isoformat() + "Z"
-    except Exception:
-        return ""
 
 
 def _normalize_username(u: str) -> str:
@@ -112,19 +106,21 @@ def signup_user(data: SignUp, force_dev: bool = False) -> Token:
     if not password_raw or len(password_raw) < 4:
         raise HTTPException(status_code=400, detail="password too short")
     key = _key_username(username_raw)
-    db = _load_auth_db()
-    if key in db["users"]:
-        raise HTTPException(status_code=409, detail="username exists")
-    account_id = uuid.uuid4().hex
-    db["users"][key] = {
-        "id": account_id,
-        "username": username_raw,  # preserve case
-        "display_name": display_raw,
-        "pass_hash": hash_password(password_raw),
-        "created_at": _now_iso(),
-        "last_seen_ip": None,
-    }
-    _save_auth_db(db)
+    with SessionLocal() as db:
+        existing = _get_account_by_key(db, key)
+        if existing:
+            raise HTTPException(status_code=409, detail="username exists")
+        account = AccountUser(
+            id=uuid.uuid4().hex,
+            username=username_raw,
+            username_key=key,
+            display_name=display_raw,
+            pass_hash=hash_password(password_raw),
+            created_at=datetime.utcnow(),
+            last_seen_ip=None,
+        )
+        db.add(account)
+        db.commit()
     # sub = display name used in chat UI (fallback to username if blank); acct = account username used for auth ops
     sub = display_raw if display_raw != "" else username_raw
     payload = {"sub": sub, "acct": username_raw, "role": "user"}
@@ -138,12 +134,13 @@ def signin_user(data: SignIn, force_dev: bool = False) -> Token:
     if not username_raw or not password_raw:
         raise HTTPException(status_code=400, detail="missing credentials")
     key = _key_username(username_raw)
-    db = _load_auth_db()
-    rec = db["users"].get(key)
-    if not rec or not verify_password(password_raw, rec.get("pass_hash", "")):
+    with SessionLocal() as db:
+        rec = _get_account_by_key(db, key)
+        pass_hash = rec.pass_hash if rec else ""
+    if not rec or not verify_password(password_raw, pass_hash):
         raise HTTPException(status_code=401, detail="invalid credentials")
-    display = rec.get("display_name") or rec.get("username") or username_raw
-    acct_user = rec.get("username") or username_raw
+    display = rec.display_name or rec.username or username_raw
+    acct_user = rec.username or username_raw
     payload = {"sub": display, "acct": acct_user, "role": "user"}
     tok = jwt.encode(_apply_dev_claim(payload, force_dev), SECRET_KEY, algorithm=ALGORITHM)
     return {"access_token": tok, "token_type": "bearer"}
@@ -154,12 +151,14 @@ def set_last_seen_ip(username: str, ip: str | None):
         if not username:
             return
         key = _key_username(username)
-        db = _load_auth_db()
-        if key not in db["users"]:
+        if not key or not ip:
             return
-        if ip:
-            db["users"][key]["last_seen_ip"] = ip
-            _save_auth_db(db)
+        with SessionLocal() as db:
+            rec = _get_account_by_key(db, key)
+            if not rec:
+                return
+            rec.last_seen_ip = ip
+            db.commit()
     except Exception:
         pass
 
@@ -168,8 +167,9 @@ def is_account_available(name: str) -> bool:
     key = _key_username(name or "")
     if not key:
         return False
-    db = _load_auth_db()
-    return key not in db["users"]
+    with SessionLocal() as db:
+        existing = _get_account_by_key(db, key)
+        return existing is None
 
 
 def is_display_available(display_name: str, current_acct: str | None = None) -> bool:
@@ -183,8 +183,8 @@ def get_account_from_token(token: str) -> AccountInfo:
         acct = _key_username(payload.get("acct") or payload.get("sub") or "")
         if not acct:
             raise HTTPException(status_code=401, detail="invalid token")
-        db = _load_auth_db()
-        rec = db["users"].get(acct)
+        with SessionLocal() as db:
+            rec = _get_account_by_key(db, acct)
         if not rec:
             # Fallback for legacy/guest tokens: return token-derived info instead of failing
             sub = (payload.get("sub") or "")
@@ -194,12 +194,7 @@ def get_account_from_token(token: str) -> AccountInfo:
                 "created_at": None,
                 "last_seen_ip": None,
             }
-        return {
-            "username": rec.get("username") or "",
-            "display_name": rec.get("display_name") or (rec.get("username") or ""),
-            "created_at": rec.get("created_at"),
-            "last_seen_ip": rec.get("last_seen_ip"),
-        }
+        return _account_to_info_obj(rec)
     except HTTPException:
         raise
     except Exception:
@@ -212,66 +207,58 @@ def update_account_from_token(token: str, upd: UpdateAccount) -> Token:
         acct_key = _key_username(payload.get("acct") or payload.get("sub") or "")
         if not acct_key:
             raise HTTPException(status_code=401, detail="invalid token")
-        db = _load_auth_db()
-        rec = db["users"].get(acct_key)
-        if not rec:
-            # Allow creating a new account record from token via update
-            # Require a new password to establish credentials
-            new_password = (upd.password or "").strip() if upd.password is not None else ""
-            if not new_password or len(new_password) < 4:
-                raise HTTPException(status_code=400, detail="password required to create account")
-            # Determine target username and display
-            want_username = _normalize_username(upd.username) if upd.username is not None else (payload.get("acct") or payload.get("sub") or "")
-            new_key = _key_username(want_username)
-            if not new_key:
-                raise HTTPException(status_code=400, detail="username required")
-            if new_key in db["users"]:
-                raise HTTPException(status_code=409, detail="username exists")
-            display = (upd.display_name or "").strip() if upd.display_name is not None else (payload.get("sub") or want_username)
-            rec = {
-                "id": uuid.uuid4().hex,
-                "username": want_username,
-                "display_name": display,
-                "pass_hash": hash_password(new_password),
-                "created_at": _now_iso(),
-                "last_seen_ip": None,
-            }
-            db["users"][new_key] = rec
-            acct_key = new_key
+        with SessionLocal() as db:
+            rec = _get_account_by_key(db, acct_key)
+            if not rec:
+                new_password = (upd.password or "").strip() if upd.password is not None else ""
+                if not new_password or len(new_password) < 4:
+                    raise HTTPException(status_code=400, detail="password required to create account")
+                want_username = _normalize_username(upd.username) if upd.username is not None else (payload.get("acct") or payload.get("sub") or "")
+                new_key = _key_username(want_username)
+                if not new_key:
+                    raise HTTPException(status_code=400, detail="username required")
+                if _get_account_by_key(db, new_key):
+                    raise HTTPException(status_code=409, detail="username exists")
+                display = (upd.display_name or "").strip() if upd.display_name is not None else (payload.get("sub") or want_username)
+                rec = AccountUser(
+                    id=uuid.uuid4().hex,
+                    username=want_username,
+                    username_key=new_key,
+                    display_name=display,
+                    pass_hash=hash_password(new_password),
+                    created_at=datetime.utcnow(),
+                    last_seen_ip=None,
+                )
+                db.add(rec)
+                acct_key = new_key
+            new_username = _normalize_username(upd.username) if upd.username is not None else None
+            new_display = (upd.display_name or "").strip() if upd.display_name is not None else None
+            new_password = (upd.password or "").strip() if upd.password is not None else None
 
-        # Normalize inputs
-        new_username = _normalize_username(upd.username) if upd.username is not None else None
-        new_display = (upd.display_name or "").strip() if upd.display_name is not None else None
-        new_password = (upd.password or "").strip() if upd.password is not None else None
+            if new_username is not None and new_username != (rec.username or ""):
+                new_key = _key_username(new_username)
+                if not new_key:
+                    raise HTTPException(status_code=400, detail="username required")
+                existing = _get_account_by_key(db, new_key)
+                if existing and existing.id != rec.id:
+                    raise HTTPException(status_code=409, detail="username exists")
+                rec.username = new_username
+                rec.username_key = new_key
+                acct_key = new_key
 
-        # Username change
-        if new_username is not None and new_username != rec.get("username"):
-            new_key = _key_username(new_username)
-            if not new_key:
-                raise HTTPException(status_code=400, detail="username required")
-            if new_key in db["users"] and new_key != acct_key:
-                raise HTTPException(status_code=409, detail="username exists")
-            # Move record key
-            db["users"][new_key] = rec
-            db["users"].pop(acct_key, None)
-            rec["username"] = new_username
-            acct_key = new_key
+            if new_display is not None and new_display != rec.display_name:
+                rec.display_name = new_display
 
-        # Display name change (optional, can be any length including empty, collisions allowed)
-        if new_display is not None and new_display != rec.get("display_name"):
-            rec["display_name"] = new_display
+            if new_password is not None:
+                if new_password and len(new_password) < 4:
+                    raise HTTPException(status_code=400, detail="password too short")
+                if new_password:
+                    rec.pass_hash = hash_password(new_password)
 
-        # Password change
-        if new_password is not None:
-            if new_password and len(new_password) < 4:
-                raise HTTPException(status_code=400, detail="password too short")
-            rec["pass_hash"] = hash_password(new_password) if new_password else rec.get("pass_hash")
+            db.commit()
 
-        _save_auth_db(db)
-
-        # Issue fresh token reflecting latest display/account username
-        display = rec.get("display_name") if rec.get("display_name") is not None else rec.get("username")
-        acct_user = rec.get("username")
+            display = rec.display_name if rec.display_name is not None else rec.username
+            acct_user = rec.username
         new_payload = {"sub": display, "acct": acct_user, "role": payload.get("role", "user")}
         if payload.get("dev_claim"):
             new_payload["dev_claim"] = True
@@ -284,18 +271,16 @@ def update_account_from_token(token: str, upd: UpdateAccount) -> Token:
 
 
 # --- Admin helpers (DEV-only via HTTP layer checks) ---
-def _get_account_by_username(username: str) -> dict | None:
+def _get_account_by_username(username: str) -> AccountUser | None:
     key = _key_username(username)
     if not key:
         return None
-    db = _load_auth_db()
-    return db["users"].get(key)
+    with SessionLocal() as db:
+        return _get_account_by_key(db, key)
 
 
 def get_account_for_admin(username: str) -> AccountInfo:
-    db = _load_auth_db()
-    key = _key_username(username)
-    rec = db["users"].get(key)
+    rec = _get_account_by_username(username)
     if not rec:
         # Return fallback for non-registered users
         return {
@@ -304,78 +289,71 @@ def get_account_for_admin(username: str) -> AccountInfo:
             "created_at": None,
             "last_seen_ip": None,
         }
-    return {
-        "username": rec.get("username") or username,
-        "display_name": rec.get("display_name") or (rec.get("username") or username),
-        "created_at": rec.get("created_at"),
-        "last_seen_ip": rec.get("last_seen_ip"),
-    }
+    return _account_to_info_obj(rec)
 
 
 def update_account_for_admin(target_username: str, upd: UpdateAccount) -> AccountInfo:
-    db = _load_auth_db()
-    tgt_key = _key_username(target_username)
-    rec = db["users"].get(tgt_key)
-    # If missing, allow creating one if password provided
-    if not rec:
-        new_password = (upd.password or "").strip() if upd.password is not None else ""
-        if not new_password or len(new_password) < 4:
-            raise HTTPException(status_code=400, detail="password required to create account")
-        new_username = _normalize_username(upd.username) if upd.username is not None else target_username
-        if not new_username:
-            raise HTTPException(status_code=400, detail="username required")
-        new_key = _key_username(new_username)
-        if new_key in db["users"]:
-            raise HTTPException(status_code=409, detail="username exists")
-        display = (upd.display_name or "").strip() if upd.display_name is not None else new_username
-        rec = {
-            "id": uuid.uuid4().hex,
-            "username": new_username,
-            "display_name": display,
-            "pass_hash": hash_password(new_password),
-            "created_at": _now_iso(),
-            "last_seen_ip": None,
-        }
-        db["users"][new_key] = rec
-    else:
-        # Update existing
-        new_username = _normalize_username(upd.username) if upd.username is not None else None
-        new_display = (upd.display_name or "").strip() if upd.display_name is not None else None
-        new_password = (upd.password or "").strip() if upd.password is not None else None
-        # Handle username change
-        if new_username is not None and new_username != rec.get("username"):
-            new_key = _key_username(new_username)
-            if not new_key:
+    with SessionLocal() as db:
+        tgt_key = _key_username(target_username)
+        rec = _get_account_by_key(db, tgt_key)
+        if not rec:
+            new_password = (upd.password or "").strip() if upd.password is not None else ""
+            if not new_password or len(new_password) < 4:
+                raise HTTPException(status_code=400, detail="password required to create account")
+            new_username = _normalize_username(upd.username) if upd.username is not None else target_username
+            if not new_username:
                 raise HTTPException(status_code=400, detail="username required")
-            if new_key in db["users"] and new_key != tgt_key:
+            new_key = _key_username(new_username)
+            if _get_account_by_key(db, new_key):
                 raise HTTPException(status_code=409, detail="username exists")
-            db["users"][new_key] = rec
-            db["users"].pop(tgt_key, None)
-            rec["username"] = new_username
-            tgt_key = new_key
-        if new_display is not None and new_display != rec.get("display_name"):
-            rec["display_name"] = new_display
-        if new_password is not None:
-            if new_password and len(new_password) < 4:
-                raise HTTPException(status_code=400, detail="password too short")
-            rec["pass_hash"] = hash_password(new_password) if new_password else rec.get("pass_hash")
-        db["users"][tgt_key] = rec
-    _save_auth_db(db)
-    return {
-        "username": rec.get("username") or target_username,
-        "display_name": rec.get("display_name") or (rec.get("username") or target_username),
-        "created_at": rec.get("created_at"),
-        "last_seen_ip": rec.get("last_seen_ip"),
-    }
+            display = (upd.display_name or "").strip() if upd.display_name is not None else new_username
+            rec = AccountUser(
+                id=uuid.uuid4().hex,
+                username=new_username,
+                username_key=new_key,
+                display_name=display,
+                pass_hash=hash_password(new_password),
+                created_at=datetime.utcnow(),
+                last_seen_ip=None,
+            )
+            db.add(rec)
+        else:
+            new_username = _normalize_username(upd.username) if upd.username is not None else None
+            new_display = (upd.display_name or "").strip() if upd.display_name is not None else None
+            new_password = (upd.password or "").strip() if upd.password is not None else None
+            if new_username is not None and new_username != rec.username:
+                new_key = _key_username(new_username)
+                if not new_key:
+                    raise HTTPException(status_code=400, detail="username required")
+                existing = _get_account_by_key(db, new_key)
+                if existing and existing.id != rec.id:
+                    raise HTTPException(status_code=409, detail="username exists")
+                rec.username = new_username
+                rec.username_key = new_key
+            if new_display is not None and new_display != rec.display_name:
+                rec.display_name = new_display
+            if new_password is not None:
+                if new_password and len(new_password) < 4:
+                    raise HTTPException(status_code=400, detail="password too short")
+                if new_password:
+                    rec.pass_hash = hash_password(new_password)
+        db.commit()
+        return _account_to_info_obj(rec)
 
 
 def delete_account_for_admin(username: str) -> dict:
     """Delete an account record by username. Returns {deleted: bool, last_seen_ip: str|None}."""
-    db = _load_auth_db()
     key = _key_username(username)
-    rec = db["users"].pop(key, None)
-    _save_auth_db(db)
-    return {"deleted": bool(rec), "last_seen_ip": (rec or {}).get("last_seen_ip") if rec else None}
+    if not key:
+        return {"deleted": False, "last_seen_ip": None}
+    with SessionLocal() as db:
+        rec = _get_account_by_key(db, key)
+        if not rec:
+            return {"deleted": False, "last_seen_ip": None}
+        last_ip = rec.last_seen_ip
+        db.delete(rec)
+        db.commit()
+        return {"deleted": True, "last_seen_ip": last_ip}
 
 
 def delete_account_from_token(token: str) -> dict:
@@ -389,10 +367,15 @@ def delete_account_from_token(token: str) -> dict:
     acct = _key_username(payload.get("acct") or payload.get("sub") or "")
     if not acct:
         raise HTTPException(status_code=401, detail="invalid token")
-    db = _load_auth_db()
-    rec = db["users"].pop(acct, None)
-    _save_auth_db(db)
-    return {"deleted": bool(rec), "username": (rec or {}).get("username") if rec else None, "last_seen_ip": (rec or {}).get("last_seen_ip") if rec else None}
+    with SessionLocal() as db:
+        rec = _get_account_by_key(db, acct)
+        if not rec:
+            return {"deleted": False, "username": None, "last_seen_ip": None}
+        username = rec.username
+        last_ip = rec.last_seen_ip
+        db.delete(rec)
+        db.commit()
+        return {"deleted": True, "username": username, "last_seen_ip": last_ip}
 
 
 def login_user(data: Login, force_dev: bool = False):

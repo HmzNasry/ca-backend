@@ -1,15 +1,19 @@
 from datetime import datetime, timedelta
-import json, os, uuid
+import json, uuid
 from typing import Dict, List
 from fastapi import WebSocket
+from ..db import SessionLocal
+from ..db_models import (
+    AdminAllowIP,
+    AdminAllowUser,
+    AdminBlacklistIP,
+    AdminBlacklistUser,
+    BannedIP,
+    BannedUser,
+    UserRegistry,
+)
 
 HISTORY = 500
-BAN_FILE = os.path.join(os.path.dirname(__file__), "..", "banned.json")
-BAN_FILE = os.path.abspath(BAN_FILE)
-# Persistent admin allow/deny lists
-ADMIN_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "admins.json"))
-ADMIN_BLACKLIST_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "admin_blacklist.json"))
-USERS_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "users.json"))
 
 # Server-side limits
 MAX_GC_NAME_LEN = 20
@@ -67,19 +71,17 @@ class ConnMgr:
         # admins persistence
         self.persistent_admin_users: set[str] = set()
         self.persistent_admin_ips: set[str] = set()
-        self._admin_user_ips: Dict[str, str] = {}
         self._load_admins()
         # blacklisted (demoted) admins persistence
         self.admin_blacklist_users: set[str] = set()
         self.admin_blacklist_ips: set[str] = set()
-        self._admin_blacklist_user_ips: Dict[str, str] = {}
         self._load_admin_blacklist()
         # group chats (GCs) runtime store: id -> {name, creator, members:set[str], history:list[dict]}
         self.gcs = {}
         # User activity: username -> bool (True=active/on tab, False=inactive)
         self.user_activity: Dict[str, bool] = {}
         # No DB: start with empty history and groups
-        # users.json identity mapping
+        # persistent user identity mapping
         self._users = {"users": {}, "ip_to_uid": {}}
         self._username_to_uid = {}
         self._load_users()
@@ -443,119 +445,179 @@ class ConnMgr:
 
     # --- persistence ---
     def _load_bans(self):
-        if os.path.exists(BAN_FILE):
-            try:
-                with open(BAN_FILE, "r") as f:
-                    data = json.load(f)
-                    self.banned_users = set(data.get("users", []))
-                    self.banned_ips = set(data.get("ips", []))
-                    # Only load mapping for banned users to avoid noise
-                    stored_map = (data.get("user_ips", {}) or {})
-                    self.user_ips.update({u: ip for u, ip in stored_map.items() if u in self.banned_users})
-            except Exception as e:
-                print("Failed to load ban list:", e)
+        try:
+            with SessionLocal() as db:
+                user_rows = db.query(BannedUser).all()
+                self.banned_users = {row.username for row in user_rows}
+                for row in user_rows:
+                    if row.username and row.last_ip:
+                        self.user_ips[row.username] = row.last_ip
+                self.banned_ips = {row.ip for row in db.query(BannedIP).all()}
+        except Exception as e:
+            print("Failed to load ban list:", e)
 
     def _save_bans(self):
-        # Persist only mappings for currently banned users
-        filtered_map = {u: self.user_ips.get(u) for u in self.banned_users if self.user_ips.get(u)}
-        data = {
-            "users": list(self.banned_users),
-            "ips": list(self.banned_ips),
-            "user_ips": filtered_map,
-        }
         try:
-            with open(BAN_FILE, "w") as f:
-                json.dump(data, f, indent=2)
+            with SessionLocal() as db:
+                existing_users = {row.username: row for row in db.query(BannedUser).all()}
+                for username in list(self.banned_users):
+                    last_ip = self.user_ips.get(username)
+                    row = existing_users.pop(username, None)
+                    if row:
+                        row.last_ip = last_ip
+                    else:
+                        db.add(BannedUser(username=username, last_ip=last_ip))
+                for stale in existing_users.values():
+                    db.delete(stale)
+
+                existing_ips = {row.ip: row for row in db.query(BannedIP).all()}
+                for ip in list(self.banned_ips):
+                    if ip in existing_ips:
+                        existing_ips.pop(ip, None)
+                    else:
+                        db.add(BannedIP(ip=ip))
+                for stale in existing_ips.values():
+                    db.delete(stale)
+                db.commit()
         except Exception as e:
             print("Failed to save ban list:", e)
 
     # --- persistent admins (allow list) ---
     def _load_admins(self):
-        if os.path.exists(ADMIN_FILE):
-            try:
-                with open(ADMIN_FILE, "r") as f:
-                    data = json.load(f)
-                    self.persistent_admin_users = set(data.get("users", []) or [])
-                    self.persistent_admin_ips = set(data.get("ips", []) or [])
-                    self._admin_user_ips = dict((data.get("user_ips", {}) or {}))
-            except Exception as e:
-                print("Failed to load admins:", e)
+        try:
+            with SessionLocal() as db:
+                user_rows = db.query(AdminAllowUser).all()
+                self.persistent_admin_users = {row.username for row in user_rows}
+                for row in user_rows:
+                    if row.username and row.last_ip:
+                        self.user_ips.setdefault(row.username, row.last_ip)
+                self.persistent_admin_ips = {row.ip for row in db.query(AdminAllowIP).all()}
+        except Exception as e:
+            print("Failed to load admins:", e)
 
     def _save_admins(self):
         try:
-            # compose mapping from last seen ip (user_ips) but only for persisted admins we know
-            filtered_map = {}
-            for u in self.persistent_admin_users:
-                ip = self.user_ips.get(u) or self._admin_user_ips.get(u)
-                if ip:
-                    filtered_map[u] = ip
-            data = {
-                "users": list(self.persistent_admin_users),
-                "ips": list(self.persistent_admin_ips),
-                "user_ips": filtered_map,
-            }
-            with open(ADMIN_FILE, "w") as f:
-                json.dump(data, f, indent=2)
+            with SessionLocal() as db:
+                existing_users = {row.username: row for row in db.query(AdminAllowUser).all()}
+                for username in list(self.persistent_admin_users):
+                    last_ip = self.user_ips.get(username)
+                    row = existing_users.pop(username, None)
+                    if row:
+                        row.last_ip = last_ip
+                    else:
+                        db.add(AdminAllowUser(username=username, last_ip=last_ip))
+                for stale in existing_users.values():
+                    db.delete(stale)
+
+                existing_ips = {row.ip: row for row in db.query(AdminAllowIP).all()}
+                for ip in list(self.persistent_admin_ips):
+                    if ip in existing_ips:
+                        existing_ips.pop(ip, None)
+                    else:
+                        db.add(AdminAllowIP(ip=ip))
+                for stale in existing_ips.values():
+                    db.delete(stale)
+                db.commit()
         except Exception as e:
             print("Failed to save admins:", e)
 
     # --- persistent admin blacklist ---
     def _load_admin_blacklist(self):
-        if os.path.exists(ADMIN_BLACKLIST_FILE):
-            try:
-                with open(ADMIN_BLACKLIST_FILE, "r") as f:
-                    data = json.load(f)
-                    self.admin_blacklist_users = set(data.get("users", []) or [])
-                    self.admin_blacklist_ips = set(data.get("ips", []) or [])
-                    self._admin_blacklist_user_ips = dict((data.get("user_ips", {}) or {}))
-            except Exception as e:
-                print("Failed to load admin blacklist:", e)
+        try:
+            with SessionLocal() as db:
+                user_rows = db.query(AdminBlacklistUser).all()
+                self.admin_blacklist_users = {row.username for row in user_rows}
+                for row in user_rows:
+                    if row.username and row.last_ip:
+                        self.user_ips.setdefault(row.username, row.last_ip)
+                self.admin_blacklist_ips = {row.ip for row in db.query(AdminBlacklistIP).all()}
+        except Exception as e:
+            print("Failed to load admin blacklist:", e)
 
     def _save_admin_blacklist(self):
         try:
-            filtered_map = {}
-            for u in self.admin_blacklist_users:
-                ip = self.user_ips.get(u) or self._admin_blacklist_user_ips.get(u)
-                if ip:
-                    filtered_map[u] = ip
-            data = {
-                "users": list(self.admin_blacklist_users),
-                "ips": list(self.admin_blacklist_ips),
-                "user_ips": filtered_map,
-            }
-            with open(ADMIN_BLACKLIST_FILE, "w") as f:
-                json.dump(data, f, indent=2)
+            with SessionLocal() as db:
+                existing_users = {row.username: row for row in db.query(AdminBlacklistUser).all()}
+                for username in list(self.admin_blacklist_users):
+                    last_ip = self.user_ips.get(username)
+                    row = existing_users.pop(username, None)
+                    if row:
+                        row.last_ip = last_ip
+                    else:
+                        db.add(AdminBlacklistUser(username=username, last_ip=last_ip))
+                for stale in existing_users.values():
+                    db.delete(stale)
+
+                existing_ips = {row.ip: row for row in db.query(AdminBlacklistIP).all()}
+                for ip in list(self.admin_blacklist_ips):
+                    if ip in existing_ips:
+                        existing_ips.pop(ip, None)
+                    else:
+                        db.add(AdminBlacklistIP(ip=ip))
+                for stale in existing_ips.values():
+                    db.delete(stale)
+                db.commit()
         except Exception as e:
             print("Failed to save admin blacklist:", e)
 
-    # --- users.json identity persistence ---
+    # --- user registry persistence ---
     def _load_users(self):
         try:
-            if os.path.exists(USERS_FILE):
-                with open(USERS_FILE, "r") as f:
-                    data = json.load(f) or {}
-                if not isinstance(data, dict):
-                    data = {}
-                self._users = {
-                    "users": dict(data.get("users", {})) if isinstance(data.get("users", {}), dict) else {},
-                    "ip_to_uid": dict(data.get("ip_to_uid", {})) if isinstance(data.get("ip_to_uid", {}), dict) else {},
-                }
-                # rebuild username -> uid index
-                self._username_to_uid = {}
-                for uid, meta in self._users.get("users", {}).items():
-                    uname = (meta or {}).get("username")
-                    if isinstance(uname, str) and uname:
-                        self._username_to_uid[uname] = uid
+            self._users = {"users": {}, "ip_to_uid": {}}
+            self._username_to_uid = {}
+            with SessionLocal() as db:
+                rows = db.query(UserRegistry).all()
+                for row in rows:
+                    meta = {
+                        "username": row.username,
+                        "ips": list(row.ips or []),
+                    }
+                    if row.tag_text:
+                        meta["tag"] = {"text": row.tag_text, "color": row.tag_color or "white"}
+                    if row.tag_locked:
+                        meta["tag_locked"] = True
+                    self._users.setdefault("users", {})[row.id] = meta
+                    if row.username:
+                        self._username_to_uid[row.username] = row.id
+                    for ip in meta.get("ips", []):
+                        if ip:
+                            self._users.setdefault("ip_to_uid", {})[ip] = row.id
         except Exception as e:
-            print("Failed to load users.json:", e)
+            print("Failed to load user registry:", e)
 
     def _save_users(self):
         try:
-            # ensure username_to_uid can be reconstructed; we only persist users + ip_to_uid
-            with open(USERS_FILE, "w") as f:
-                json.dump(self._users, f, indent=2)
+            with SessionLocal() as db:
+                stored = self._users.get("users", {}) or {}
+                existing = {row.id: row for row in db.query(UserRegistry).all()}
+                for uid, meta in stored.items():
+                    username = (meta or {}).get("username")
+                    ips = list((meta or {}).get("ips") or [])
+                    tag = meta.get("tag") if isinstance(meta.get("tag"), dict) else None
+                    tag_text = (tag or {}).get("text")
+                    tag_color = (tag or {}).get("color")
+                    tag_locked = bool(meta.get("tag_locked"))
+                    row = existing.pop(uid, None)
+                    if row:
+                        row.username = username
+                        row.ips = ips
+                        row.tag_text = tag_text
+                        row.tag_color = tag_color
+                        row.tag_locked = tag_locked
+                    else:
+                        db.add(UserRegistry(
+                            id=uid,
+                            username=username,
+                            ips=ips,
+                            tag_text=tag_text,
+                            tag_color=tag_color,
+                            tag_locked=tag_locked,
+                        ))
+                for stale in existing.values():
+                    db.delete(stale)
+                db.commit()
         except Exception as e:
-            print("Failed to save users.json:", e)
+            print("Failed to save user registry:", e)
 
     # --- persisted tag helpers ---
     def _ensure_uid_for_username(self, username: str) -> str:
@@ -573,7 +635,7 @@ class ConnMgr:
         return uid
 
     def set_user_tag(self, username: str, tag: dict | None):
-        """Update runtime tag map and persist tag into users.json for this username."""
+        """Update runtime tag map and persist tag into the registry for this username."""
         uname = (username or "").strip()
         if not uname:
             return
@@ -586,7 +648,7 @@ class ConnMgr:
             if tag.get("special"):
                 t_obj["special"] = tag.get("special")
             self.tags[uname] = t_obj
-        # Persist in users.json
+        # Persist in the registry storage
         uid = self._ensure_uid_for_username(uname)
         if not uid:
             return
@@ -637,7 +699,7 @@ class ConnMgr:
         self._username_to_uid = {}
         self._save_users()
 
-    # Public helpers for managing users.json registry
+    # Public helpers for managing the user registry
     def list_user_registry(self) -> List[str]:
         try:
             names = []
@@ -651,7 +713,7 @@ class ConnMgr:
             return []
 
     def remove_user_identity(self, username: str) -> bool:
-        """Remove a username and its uid/ip associations from users.json.
+        """Remove a username and its uid/ip associations from the registry.
         Returns True if removed, False if not found or failed.
         """
         try:
@@ -733,7 +795,7 @@ class ConnMgr:
 
     def ensure_user_identity(self, ip: str | None, username: str) -> tuple[bool, str | None, str | None]:
         """Record last-seen IP and maintain a lightweight username registry.
-        Always ensure a users.json entry exists for this username and refresh IP mapping.
+        Always ensure a registry entry exists for this username and refresh IP mapping.
         """
         try:
             uname = (username or "").strip()
@@ -819,8 +881,6 @@ class ConnMgr:
         try:
             if ip:
                 self.user_ips[user] = ip
-                # Do not persist non-banned users to banned.json
-                self._save_bans()
         except Exception:
             pass
         # Mark user as active on connect

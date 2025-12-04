@@ -203,7 +203,7 @@ async def handle_admin_commands(manager: ConnMgr, ws, sub: str, role: str, txt: 
         manager.admin_blacklist_ips = set()
         manager._admin_blacklist_user_ips = {}
         manager._save_admin_blacklist()
-        # 3) Clear users registry (users.json)
+        # 3) Clear user registry (database-backed)
         manager.reset_users_registry()
         # 4) Remove uploads (dm, gc, main contents)
         try:
@@ -296,7 +296,7 @@ async def handle_admin_commands(manager: ConnMgr, ws, sub: str, role: str, txt: 
                 pass
         return True
 
-    # /users (DEV only) -> prompt list from auth users file (auth_users.json)
+    # /users (DEV only) -> prompt list from account database
     if re.match(r'^\s*/users\s*$', txt, re.I):
         if not is_dev(manager, sub):
             await _alert(ws, "INFO", "only DEV can use /users")
@@ -308,7 +308,7 @@ async def handle_admin_commands(manager: ConnMgr, ws, sub: str, role: str, txt: 
         await ws.send_text(json.dumps({"type": "users_prompt", "users": reg_users}))
         return True
 
-    # /rmuser "username" (DEV only) -> remove from users.json registry and kick if online
+    # /rmuser "username" (DEV only) -> remove from persistent user registry and kick if online
     m = re.match(r'^\s*/rmuser\s+"([^"]+)"\s*$', txt, re.I)
     if m:
         if not is_dev(manager, sub):

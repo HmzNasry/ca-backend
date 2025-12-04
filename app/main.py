@@ -180,7 +180,7 @@ try:
 
         # Capture potential last IP before delete for best-effort disconnect
         result = delete_account_for_admin(username)
-        # Also remove identity from users.json registry so the name is fully freed
+        # Also remove identity from the persistent user registry so the name is fully freed
         try:
             ws_manager.remove_user_identity(username)
         except Exception:
@@ -278,7 +278,7 @@ try:
         result = delete_account_from_token(token)
         if not (isinstance(result, dict) and result.get("deleted")):
             raise HTTPException(status_code=404, detail="not found")
-        # Remove identity from users.json registry as well to fully free the name
+        # Remove identity from the persistent user registry as well to fully free the name
         try:
             if requester:
                 ws_manager.remove_user_identity(requester)
