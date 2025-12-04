@@ -11,6 +11,7 @@ deployments (Render, etc.) should provide a PostgreSQL connection string via
 | Name | Description |
 | --- | --- |
 | `DATABASE_URL` | SQLAlchemy connection string. Defaults to `sqlite:///./chatapp.db` when unset. Use `postgresql+psycopg2://<user>:<pass>@<host>:<port>/<db>` on Render. |
+| `OLLAMA_API_URL` | Optional override for the Ollama endpoint. Defaults to `http://localhost:11434/api/chat` for local development. Set this to the public URL of your tunnel/external Ollama host when deploying to Render. |
 
 ## Local development
 
@@ -29,7 +30,8 @@ boot.
 2. Copy the provided internal connection string (it uses the `postgresql://`
    scheme).
 3. In the backend service's settings add `DATABASE_URL` with that value.
-4. Trigger a deploy. SQLAlchemy + psycopg2 will create the tables on startup.
+4. Add `OLLAMA_API_URL` pointing at the HTTPS tunnel or remote Ollama host you control (for example, a Cloudflare Tunnel that forwards to `http://localhost:11434` on your laptop). Lock the tunnel down with auth/IP rules.
+5. Trigger a deploy. SQLAlchemy + psycopg2 will create the tables on startup.
 
 ## Migrating legacy JSON data
 

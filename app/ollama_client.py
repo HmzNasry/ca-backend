@@ -8,7 +8,7 @@ from typing import AsyncGenerator, Optional, List, Dict
 from .upload import UPLOAD_DIR
 
 # endpoints
-OLLAMA_API = "http://localhost:11434/api/chat"
+OLLAMA_API = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/chat")
 TEXT_MODEL = "llama3.1:8b"
 IMAGE_MODEL = "llava:7b"
 log = logging.getLogger(__name__)
@@ -140,4 +140,3 @@ async def stream_ollama(prompt: str, image_url: Optional[str] = None, history: O
     except Exception as e:
         log.exception("Ollama streaming failed: %s", e)
         yield "[AI ERROR: STREAM FAILED]"
-
