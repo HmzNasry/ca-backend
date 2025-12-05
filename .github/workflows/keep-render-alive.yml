@@ -1,0 +1,13 @@
+name: keep-render-alive
+
+on:
+  schedule:
+    - cron: "*/16 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: ping health endpoint
+        run: curl -fsSL https://ca-backend-eujk.onrender.com/health || exit 1
