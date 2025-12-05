@@ -12,6 +12,7 @@ from ..db_models import (
     BannedUser,
     UserRegistry,
 )
+from . import persistence
 
 HISTORY = 500
 
@@ -37,16 +38,19 @@ class ConnMgr:
         if not gc:
             return
         gc.setdefault("members", set()).add(user)
+        self._persist_group_state(gid)
 
     def remove_user_from_gc(self, gid: str, user: str):
         gc = self.gcs.get(gid)
         if not gc:
             return
         gc.setdefault("members", set()).discard(user)
+        self._persist_group_state(gid)
     def __init__(self):
         self.active: Dict[str, WebSocket] = {}
         self.user_ips: Dict[str, str] = {}  # map username -> last seen IP (in-memory)
         self.history: List[dict] = []  # main chat history
+        self._load_main_history()
         self.dm_histories: Dict[str, List[dict]] = {}  # key: dm_id(userA,userB) -> history list
         # moderation/admin & roles
         self.roles: Dict[str, str] = {}  # username -> role (e.g., 'admin' or 'user')
@@ -77,10 +81,10 @@ class ConnMgr:
         self.admin_blacklist_ips: set[str] = set()
         self._load_admin_blacklist()
         # group chats (GCs) runtime store: id -> {name, creator, members:set[str], history:list[dict]}
-        self.gcs = {}
+        self.gcs: Dict[str, dict] = {}
+        self._load_groups_from_db()
         # User activity: username -> bool (True=active/on tab, False=inactive)
         self.user_activity: Dict[str, bool] = {}
-        # No DB: start with empty history and groups
         # persistent user identity mapping
         self._users = {"users": {}, "ip_to_uid": {}}
         self._username_to_uid = {}
@@ -130,27 +134,40 @@ class ConnMgr:
 
     def get_dm_history(self, a: str, b: str) -> List[dict]:
         tid = self.dm_id(a, b)
-        return list(self.dm_histories.get(tid, []))
+        hist = self.dm_histories.get(tid)
+        if hist is None:
+            hist = self._load_thread_history("dm", tid)
+            self.dm_histories[tid] = hist
+        return list(hist)
 
     def _append_dm(self, a: str, b: str, obj: dict):
         tid = self.dm_id(a, b)
-        hist = self.dm_histories.setdefault(tid, [])
+        hist = self.dm_histories.get(tid)
+        if hist is None:
+            hist = self._load_thread_history("dm", tid)
+            self.dm_histories[tid] = hist
         hist.append(obj)
         if len(hist) > HISTORY:
             self.dm_histories[tid] = hist[-HISTORY:]
-        # No DB: do nothing
+        self._persist_message("dm", tid, obj)
 
     def update_dm_text(self, a: str, b: str, msg_id: str, text: str) -> bool:
         """Update text of a DM message in-place in the canonical stored history."""
         tid = self.dm_id(a, b)
         arr = self.dm_histories.get(tid)
+        if arr is None:
+            arr = self._load_thread_history("dm", tid)
+            self.dm_histories[tid] = arr
         if not arr:
             return False
         for m in arr:
             if m.get("id") == msg_id:
                 m["text"] = text
                 m["edited"] = True
-                # No DB: do nothing
+                try:
+                    persistence.update_message_text("dm", tid, msg_id, text)
+                except Exception:
+                    pass
                 return True
         return False
 
@@ -160,6 +177,10 @@ class ConnMgr:
             if m.get("id") == msg_id:
                 m["text"] = text
                 m["edited"] = True
+                try:
+                    persistence.update_message_text("main", None, msg_id, text)
+                except Exception:
+                    pass
                 return True
         return False
 
@@ -208,11 +229,18 @@ class ConnMgr:
         if idx is None:
             return False
         self.history.pop(idx)
+        try:
+            persistence.delete_message("main", None, msg_id)
+        except Exception:
+            pass
         return True
 
     def delete_dm_message(self, a: str, b: str, msg_id: str, requester: str | None = None, allow_any: bool = False) -> bool:
         tid = self.dm_id(a, b)
         arr = self.dm_histories.get(tid)
+        if arr is None:
+            arr = self._load_thread_history("dm", tid)
+            self.dm_histories[tid] = arr
         if not arr:
             return False
         idx = next((i for i, m in enumerate(arr) if m.get("id") == msg_id), None)
@@ -221,13 +249,19 @@ class ConnMgr:
         if not allow_any and requester and arr[idx].get("sender") != requester:
             return False
         arr.pop(idx)
-        # No DB: do nothing
+        try:
+            persistence.delete_message("dm", tid, msg_id)
+        except Exception:
+            pass
         return True
 
     def clear_dm_history(self, a: str, b: str):
         tid = self.dm_id(a, b)
         self.dm_histories[tid] = []
-        # No DB: do nothing
+        try:
+            persistence.clear_history("dm", tid)
+        except Exception:
+            pass
 
     # --- GC helpers ---
     def create_gc(self, name: str, creator: str, members: List[str]) -> str:
@@ -235,15 +269,16 @@ class ConnMgr:
         gid = f"gc-{int(datetime.utcnow().timestamp()*1000)}-{uuid.uuid4().hex[:6]}"
         mems = set(members or [])
         mems.add(creator)
+        clean_name = _clamp_with_ellipsis(name or "Group Chat", MAX_GC_NAME_LEN)
         self.gcs[gid] = {
             "id": gid,
             # Enforce max GC name length server-side
-            "name": _clamp_with_ellipsis(name or "Group Chat", MAX_GC_NAME_LEN),
+            "name": clean_name,
             "creator": creator,
             "members": mems,
             "history": [],
         }
-        # No DB: do nothing
+        self._persist_group_state(gid)
         return gid
 
     def user_in_gc(self, gid: str, user: str) -> bool:
@@ -256,13 +291,18 @@ class ConnMgr:
         gc = self.gcs.get(gid)
         if not gc:
             return []
+        if "history" not in gc or gc.get("history") is None:
+            gc["history"] = self._load_thread_history("gc", gid)
         arr = gc.get("history", [])
         return list(arr)
 
     def clear_gc_history(self, gid: str):
         if gid in self.gcs:
             self.gcs[gid]["history"] = []
-        # No DB: do nothing
+        try:
+            persistence.clear_history("gc", gid)
+        except Exception:
+            pass
 
     def update_gc_text(self, gid: str, msg_id: str, text: str) -> bool:
         gc = self.gcs.get(gid)
@@ -273,6 +313,10 @@ class ConnMgr:
             if m.get("id") == msg_id:
                 m["text"] = text
                 m["edited"] = True
+                try:
+                    persistence.update_message_text("gc", gid, msg_id, text)
+                except Exception:
+                    pass
                 return True
         return False
 
@@ -291,7 +335,10 @@ class ConnMgr:
             if arr[idx].get("sender") != requester and requester != gc.get("creator"):
                 return False
         arr.pop(idx)
-        # No DB: do nothing
+        try:
+            persistence.delete_message("gc", gid, msg_id)
+        except Exception:
+            pass
         return True
 
     async def _broadcast_gc(self, gid: str, obj: dict):
@@ -306,6 +353,7 @@ class ConnMgr:
             gc["history"].append(base)
             if len(gc["history"]) > HISTORY:
                 gc["history"] = gc["history"][-HISTORY:]
+            self._persist_message("gc", gid, base)
         data = json.dumps(base)
         gc = self.gcs.get(gid)
         if not gc:
@@ -369,7 +417,7 @@ class ConnMgr:
             if creator:
                 mset.add(creator)
             gc["members"] = mset
-        # No DB: do nothing
+        self._persist_group_state(gid)
 
     # ---- reactions helpers ----
     def _toggle_reaction_map(self, react_map: dict | None, emoji: str, username: str) -> dict:
@@ -397,7 +445,10 @@ class ConnMgr:
 
     def toggle_dm_reaction(self, a: str, b: str, msg_id: str, emoji: str, username: str) -> dict | None:
         tid = self.dm_id(a, b)
-        arr = self.dm_histories.get(tid) or []
+        arr = self.dm_histories.get(tid)
+        if arr is None:
+            arr = self._load_thread_history("dm", tid)
+            self.dm_histories[tid] = arr
         for m in arr:
             if m.get("id") == msg_id:
                 m["reactions"] = self._toggle_reaction_map(m.get("reactions"), emoji, username)
@@ -406,6 +457,8 @@ class ConnMgr:
 
     def toggle_gc_reaction(self, gid: str, msg_id: str, emoji: str, username: str) -> dict | None:
         gc = self.gcs.get(gid) or {}
+        if "history" not in gc or gc.get("history") is None:
+            gc["history"] = self._load_thread_history("gc", gid)
         arr = gc.get("history", [])
         for m in arr:
             if m.get("id") == msg_id:
@@ -437,11 +490,72 @@ class ConnMgr:
         # If no members left, delete GC entirely
         if not mems:
             self.gcs.pop(gid, None)
+            try:
+                persistence.delete_group(gid)
+            except Exception:
+                pass
+        else:
+            self._persist_group_state(gid)
 
     # --- presence (join/leave) ---
     async def _presence(self, user: str, action: str):
         # action: "join" | "leave"; not stored in history
         await self._broadcast({"type": "presence", "user": user, "action": action})
+
+    # --- internal persistence helpers ---
+    def _load_main_history(self):
+        try:
+            self.history = persistence.load_recent("main", None, HISTORY)
+        except Exception:
+            self.history = []
+
+    def _load_thread_history(self, thread: str, scope: str | None) -> List[dict]:
+        try:
+            return persistence.load_recent(thread, scope, HISTORY)
+        except Exception:
+            return []
+
+    def _load_groups_from_db(self):
+        try:
+            groups = persistence.get_all_groups()
+        except Exception:
+            groups = []
+        for gc in groups:
+            gid = gc.get("id")
+            if not gid:
+                continue
+            self.gcs[gid] = {
+                "id": gid,
+                "name": gc.get("name"),
+                "creator": gc.get("creator"),
+                "members": set(gc.get("members") or []),
+                "history": self._load_thread_history("gc", gid),
+            }
+
+    def _persist_group_state(self, gid: str):
+        gc = self.gcs.get(gid)
+        if not gc:
+            return
+        try:
+            persistence.create_group(
+                gid,
+                gc.get("name") or "Group Chat",
+                gc.get("creator"),
+                list(gc.get("members", set())),
+            )
+        except Exception:
+            pass
+
+    def _should_persist_message(self, obj: dict) -> bool:
+        return obj.get("type") in ("message", "media", "poll", "system")
+
+    def _persist_message(self, thread: str, scope: str | None, obj: dict):
+        if not self._should_persist_message(obj):
+            return
+        try:
+            persistence.save_message(thread, scope, obj)
+        except Exception:
+            pass
 
     # --- persistence ---
     def _load_bans(self):
@@ -951,6 +1065,7 @@ class ConnMgr:
             self.history.append(msg)
             if len(self.history) > HISTORY:
                 self.history = self.history[-HISTORY:]
+            self._persist_message("main", None, msg)
         await self._broadcast(msg)
 
     async def _broadcast(self, obj: dict):
@@ -961,6 +1076,7 @@ class ConnMgr:
                 self.history.append(obj)
                 if len(self.history) > HISTORY:
                     self.history = self.history[-HISTORY:]
+                self._persist_message("main", None, obj)
         data = json.dumps(obj)
         for ws in list(self.active.values()):
             try:
